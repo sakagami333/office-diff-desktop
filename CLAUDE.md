@@ -27,7 +27,7 @@ tests/check_bat_windows.ps1 Windows CI 用: .bat 経由・日本語パスの確�
 - 使い方を変えたら README.md と 使い方.txt の両方をそろえる
 - 変更したら `pytest -q` を通し、push 後に GitHub Actions の Windows ジョブが成功することを確認する
 - テキスト化・差分のルールは office-diff-sample（PR コメント版）の spec/SPEC.md「F3 テキスト化ルール」「F4」に合わせる
-- Excel はこのリポジトリが先行して対応（PR コメント版は未対応・TASKS T2-3）。表示形式:
+- Excel は PR コメント版（office-diff-sample の T2-3）と同じ形式。形式を変えるときは両方そろえる（tests/make_samples.py も共通）:
   シートは名前で対応付け（無ければ並び順＋中身の類似度で「名前変更」）、1行を `N行目 | A:値 | B:=数式 → 結果`、
   行単位の LCS（巨大な場合は OFFICEDIFF_XLSX_MAXCELLS 超で行番号突き合わせ）、日付は yyyy-MM-dd、ふりがな(rPh)は除外
 - シートの XML は XmlReader で読む（XPath・セルごとの関数呼び出しは数万セルで遅くなるため避ける）
