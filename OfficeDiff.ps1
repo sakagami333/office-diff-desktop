@@ -1,5 +1,5 @@
 ﻿<#
-  OfficeDiff.ps1  ―  2つの Word / PowerPoint ファイルの変更点を .html（ブラウザ表示用）と .diff（unified diff 形式）に出力する
+  OfficeDiff.ps1  ―  2つの Word / PowerPoint / Excel ファイルの変更点を .html（ブラウザ表示用）と .diff（unified diff 形式）に出力する
 
   使い方:
     OfficeDiff.bat に2つのファイルをまとめてドラッグ＆ドロップ
@@ -12,7 +12,7 @@
       -NoOpen  出力した .html をブラウザで開かない
       -OutDir  出力先フォルダ（省略時は このツールと同じフォルダの output。無ければ作成）
 
-  ・Office のインストールは不要（.docx / .pptx の中身を直接読む）
+  ・Office のインストールは不要（.docx / .pptx / .xlsx の中身を直接読む）
   ・Windows PowerShell 5.1（Windows 10/11 標準）で動作
   ・テキスト化と差分のルールは GitHub の PR コメント版（scripts/office_diff.py）と同じ
 #>
@@ -276,10 +276,281 @@ function Get-Slides($Zip) {
     return ,$slides.ToArray()
 }
 
+# ======================================================================== Excel
+
+$XLNS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+
+function New-XlNs($Xml) {
+    $m = New-Object System.Xml.XmlNamespaceManager($Xml.NameTable)
+    $m.AddNamespace('x', $XLNS)
+    $m.AddNamespace('r', $OOXML.r)
+    return ,$m
+}
+
+function Get-XlsxDateStyles($Zip) {
+    # セルの書式番号（s 属性）ごとに「日付・時刻の書式か」を返す
+    $result = New-Object System.Collections.Generic.List[bool]
+    $st = Get-ZipXml $Zip 'xl/styles.xml'
+    if ($null -eq $st) { return ,$result.ToArray() }
+    $ns = New-XlNs $st
+    $custom = @{}
+    foreach ($f in $st.SelectNodes('/x:styleSheet/x:numFmts/x:numFmt', $ns)) {
+        $code = $f.GetAttribute('formatCode')
+        # "文字列" [色/条件] \x _x *x を除いてから、日付・時刻の記号があるかを見る
+        $plain = ($code -replace '"[^"]*"', '' -replace '\[[^\]]*\]', '' -replace '\\.', '' -replace '[_*].', '')
+        $custom[[int]$f.GetAttribute('numFmtId')] = ($plain -match '[ymdhsYMDHSgegE]' -and $plain -notmatch '^(?i)general$')
+    }
+    # Excel 組み込みの日付・時刻書式（日本語版の和暦・年月日表記を含む）
+    $builtin = @(14..22) + @(27..36) + @(45..47) + @(50..58)
+    foreach ($xf in $st.SelectNodes('/x:styleSheet/x:cellXfs/x:xf', $ns)) {
+        $id = [int]$xf.GetAttribute('numFmtId')
+        $result.Add($(if ($custom.ContainsKey($id)) { $custom[$id] } else { $builtin -contains $id }))
+    }
+    return ,$result.ToArray()
+}
+
+function Format-XlsxNumber([string]$V, [bool]$IsDate) {
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $d = 0.0
+    if (-not [double]::TryParse($V, [System.Globalization.NumberStyles]::Float, $inv, [ref]$d)) { return $V }
+    if ($IsDate -and $d -ge 0 -and $d -lt 2958466) {
+        $dt = [DateTime]::FromOADate($d)
+        if ($d -eq [Math]::Floor($d)) { return $dt.ToString('yyyy-MM-dd') }
+        if ($d -lt 1) { return $dt.ToString('HH:mm:ss') }
+        return $dt.ToString('yyyy-MM-dd HH:mm:ss')
+    }
+    # 0.1+0.2=0.30000000000000004 のような誤差を見せないよう 15 桁に丸める
+    return $d.ToString('G15', $inv)
+}
+
+function Read-XlsxRows($Stream, $Sst, $DateStyles) {
+    # シートの XML を先頭から順に読む。大きなシート（数万セル）でも速いよう、
+    # XPath や関数呼び出しを使わず、よくある「文字列」「数値」のセルはこの中で直接処理する
+    $settings = New-Object System.Xml.XmlReaderSettings
+    $settings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+    $rd = [System.Xml.XmlReader]::Create($Stream, $settings)
+    $ELEM = [System.Xml.XmlNodeType]::Element; $END = [System.Xml.XmlNodeType]::EndElement
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $nstyle = [System.Globalization.NumberStyles]::Float
+    $nDate = $DateStyles.Count
+    $rows = New-Object System.Collections.Generic.List[object]
+    $sb = New-Object System.Text.StringBuilder
+    $inRow = $false; $inCell = $false; $rowNo = 0; $colNo = 0
+    $col = ''; $t = ''; $st = ''; $v = ''; $f = $null; $inl = ''
+    $d = 0.0
+    $advance = $true   # ReadElementContentAsString / Skip は読み位置を進めるので、そのときは Read() しない
+    try {
+        while ($true) {
+            if ($advance -and -not $rd.Read()) { break }
+            if ($rd.EOF) { break }
+            $advance = $true
+            $nt = $rd.NodeType
+            if ($nt -eq $ELEM) {
+                $ln = $rd.LocalName
+                if ($ln -ceq 'c') {
+                    if (-not $inRow) { continue }
+                    $colNo++
+                    $ref = $rd.GetAttribute('r')
+                    $col = $(if ($ref) { $ref.TrimEnd('0123456789'.ToCharArray()) } else { [string][char](64 + $colNo) })
+                    $t = $rd.GetAttribute('t'); $st = $rd.GetAttribute('s'); $v = ''; $f = $null; $inl = ''
+                    $inCell = -not $rd.IsEmptyElement   # 書式だけの空セルは読まない
+                } elseif ($ln -ceq 'v') {
+                    if ($inCell) { $v = $rd.ReadElementContentAsString(); $advance = $false }
+                } elseif ($ln -ceq 'row') {
+                    $r = $rd.GetAttribute('r')
+                    $rowNo = $(if ($r) { [int]$r } else { $rowNo + 1 }); $colNo = 0
+                    [void]$sb.Clear()
+                    $inRow = -not $rd.IsEmptyElement
+                } elseif ($ln -ceq 'f') {
+                    if ($inCell) {
+                        if ($rd.IsEmptyElement) { $f = '' } else { $f = $rd.ReadElementContentAsString(); $advance = $false }
+                    }
+                } elseif ($ln -ceq 't') {
+                    if ($inCell -and $t -ceq 'inlineStr') { $inl += $rd.ReadElementContentAsString(); $advance = $false }
+                } elseif ($ln -ceq 'rPh') {
+                    $rd.Skip(); $advance = $false   # ふりがなは読まない
+                }
+            } elseif ($nt -eq $END) {
+                $ln = $rd.LocalName
+                if ($ln -ceq 'c' -and $inCell) {
+                    $inCell = $false
+                    if ($t -ceq 's') {
+                        $i = 0
+                        $val = $(if ([int]::TryParse($v, [ref]$i) -and $i -lt $Sst.Count) { $Sst[$i] } else { '' })
+                    } elseif (-not $t -or $t -ceq 'n') {
+                        if ($v -eq '') { $val = '' }
+                        else {
+                            $si = $(if ($st) { [int]$st } else { 0 })
+                            if ($si -lt $nDate -and $DateStyles[$si]) { $val = Format-XlsxNumber $v $true }
+                            elseif ([double]::TryParse($v, $nstyle, $inv, [ref]$d)) { $val = $d.ToString('G15', $inv) }
+                            else { $val = $v }
+                        }
+                    } elseif ($t -ceq 'inlineStr') { $val = $inl }
+                    elseif ($t -ceq 'b') { $val = $(if ($v -eq '1') { 'TRUE' } elseif ($v -eq '0') { 'FALSE' } else { '' }) }
+                    else { $val = $v }   # str（数式の文字列結果）・e（エラー）
+                    if ($val.IndexOf("`n") -ge 0) { $val = ($val -replace "\r?\n", ' / ') }
+                    if ($null -ne $f) {
+                        $fx = $(if ($f) { '=' + $f } else { '=(共有数式)' })
+                        $val = $(if ($val -ne '') { "$fx → $val" } else { $fx })
+                    }
+                    if ($val -ne '') {
+                        if ($sb.Length) { [void]$sb.Append(' | ') }
+                        [void]$sb.Append($col).Append(':').Append($val)
+                    }
+                } elseif ($ln -ceq 'row') {
+                    if ($inRow -and $sb.Length) { $rows.Add([pscustomobject]@{ Num = $rowNo; Text = $sb.ToString() }) }
+                    $inRow = $false
+                }
+            }
+        }
+    } finally { $rd.Dispose() }
+    return ,$rows.ToArray()
+}
+
+function Get-XlsxSheets($Zip) {
+    $wb = Get-ZipXml $Zip 'xl/workbook.xml'
+    if ($null -eq $wb) { throw 'xl/workbook.xml が見つかりません' }
+    $ns = New-XlNs $wb
+    $rels = Get-Rels $Zip 'xl/workbook.xml'
+
+    # 共有文字列（ふりがな rPh は除く）
+    $sst = New-Object System.Collections.Generic.List[string]
+    $sstPath = 'xl/sharedStrings.xml'
+    foreach ($r in $rels.Values) { if ($r.Type -like '*/sharedStrings') { $sstPath = $r.Target } }
+    $sx = Get-ZipXml $Zip $sstPath
+    if ($sx) {
+        $sns = New-XlNs $sx
+        foreach ($si in $sx.SelectNodes('/x:sst/x:si', $sns)) {
+            $sst.Add((($si.SelectNodes('x:t | x:r/x:t', $sns) | ForEach-Object { $_.InnerText }) -join ''))
+        }
+    }
+    $dateStyles = Get-XlsxDateStyles $Zip
+
+    $sheets = New-Object System.Collections.Generic.List[object]
+    foreach ($sh in $wb.SelectNodes('/x:workbook/x:sheets/x:sheet', $ns)) {
+        $name = $sh.GetAttribute('name')
+        $rid = $sh.GetAttribute('id', $OOXML.r)
+        $rows = @()
+        if ($rels.ContainsKey($rid) -and $rels[$rid].Type -like '*/worksheet') {
+            $entry = $Zip.GetEntry($rels[$rid].Target)
+            if ($entry) {
+                $stream = $entry.Open()
+                try { $rows = Read-XlsxRows $stream $sst $dateStyles } finally { $stream.Dispose() }
+            }
+        }
+        $sheets.Add([pscustomobject]@{ Name = $name; Rows = @($rows) })
+    }
+    return ,$sheets.ToArray()
+}
+
+function Format-XlsxRow($Row) { return ('{0}行目 | {1}' -f $Row.Num, $Row.Text) }
+
+function Get-RowDiffLines($A, $B, [int]$Context = 2) {
+    # 行単位で比べる（行を挿入・削除しても、それ以降の行がすべて変更扱いにならない）
+    $ta = [string[]]@($A | ForEach-Object { $_.Text }); $tb = [string[]]@($B | ForEach-Object { $_.Text })
+    # 計算表がこれより大きくなる（巨大なシートで変更範囲も広い）ときは、行番号どうしの突き合わせに切り替える
+    $max = $(if ($env:OFFICEDIFF_XLSX_MAXCELLS) { [long]$env:OFFICEDIFF_XLSX_MAXCELLS } else { 4000000 })
+    $ops = Get-EditOps $ta $tb $max
+    $disp = New-Object System.Collections.Generic.List[object]
+    if ($null -ne $ops) {
+        foreach ($o in $ops) {
+            $row = $(if ($o.Tag -eq '-') { $A[$o.AI] } else { $B[$o.BI] })
+            $disp.Add(@{ Tag = $o.Tag; Line = (Format-XlsxRow $row); Num = $row.Num })
+        }
+    } else {
+        # 非常に大きなシートで変更範囲も広いときは、行番号どうしで突き合わせる
+        $ma = @{}; foreach ($r in $A) { $ma[$r.Num] = $r }
+        $mb = @{}; foreach ($r in $B) { $mb[$r.Num] = $r }
+        foreach ($num in (@($ma.Keys) + @($mb.Keys) | Sort-Object -Unique)) {
+            $ra = $ma[$num]; $rb = $mb[$num]
+            if ($ra -and $rb -and $ra.Text -ceq $rb.Text) { $disp.Add(@{ Tag = ' '; Line = (Format-XlsxRow $rb); Num = $num }); continue }
+            if ($ra) { $disp.Add(@{ Tag = '-'; Line = (Format-XlsxRow $ra); Num = $num }) }
+            if ($rb) { $disp.Add(@{ Tag = '+'; Line = (Format-XlsxRow $rb); Num = $num }) }
+        }
+    }
+    $out = New-Object System.Collections.Generic.List[string]
+    $changed = @(); for ($k = 0; $k -lt $disp.Count; $k++) { if ($disp[$k].Tag -ne ' ') { $changed += $k } }
+    if ($changed.Count -eq 0) { return ,$out.ToArray() }
+    $groups = @(); $s = $changed[0]; $e = $changed[0]
+    for ($c = 1; $c -lt $changed.Count; $c++) {
+        $k = $changed[$c]
+        if ($k - $e -le 2 * $Context) { $e = $k } else { $groups += , @($s, $e); $s = $k; $e = $k }
+    }
+    $groups += , @($s, $e)
+    foreach ($g in $groups) {
+        $from = [Math]::Max(0, $g[0] - $Context); $to = [Math]::Min($disp.Count - 1, $g[1] + $Context)
+        $out.Add("@@ $($disp[$g[0]].Num)行目付近 @@")
+        for ($k = $from; $k -le $to; $k++) { $out.Add($disp[$k].Tag + $disp[$k].Line) }
+    }
+    return ,$out.ToArray()
+}
+
+function Get-SheetDiffLines($Old, $New, [int]$MaxRows = 200) {
+    # シートは名前で対応付ける。名前が見つからないシート同士は、並び順と中身が似ていれば「名前変更」とみなす
+    $newPos = @{}; for ($j = 0; $j -lt $New.Count; $j++) { $newPos[$New[$j].Name] = $j }
+    $oldNames = @{}; foreach ($s in $Old) { $oldNames[$s.Name] = $true }
+    $unOld = @(for ($i = 0; $i -lt $Old.Count; $i++) { if (-not $newPos.ContainsKey($Old[$i].Name)) { $i } })
+    $unNew = @(for ($j = 0; $j -lt $New.Count; $j++) { if (-not $oldNames.ContainsKey($New[$j].Name)) { $j } })
+    $renamed = @{}   # 旧index → 新index
+    $u = 0
+    foreach ($i in $unOld) {
+        if ($u -ge $unNew.Count) { break }
+        $j = $unNew[$u]
+        $sa = [string[]]@($Old[$i].Rows | Select-Object -First 200 | ForEach-Object { $_.Text })
+        $sb = [string[]]@($New[$j].Rows | Select-Object -First 200 | ForEach-Object { $_.Text })
+        if ((Get-LcsRatio $sa $sb) -ge 0.5) { $renamed[$i] = $j; $u++ }
+    }
+    $matchedNew = @{}; foreach ($j in $renamed.Values) { $matchedNew[$j] = $true }
+
+    $keyed = @(); $lastNew = -1; $seq = 0
+    for ($i = 0; $i -lt $Old.Count; $i++) {
+        $j = $(if ($newPos.ContainsKey($Old[$i].Name)) { $newPos[$Old[$i].Name] } elseif ($renamed.ContainsKey($i)) { $renamed[$i] } else { $null })
+        if ($null -ne $j) { $lastNew = $j; $keyed += [pscustomobject]@{ K = [double]$j; Seq = $seq++; I = $i; J = $j } }
+        else { $keyed += [pscustomobject]@{ K = $lastNew + 0.5; Seq = $seq++; I = $i; J = $null } }
+    }
+    for ($j = 0; $j -lt $New.Count; $j++) {
+        if (-not $oldNames.ContainsKey($New[$j].Name) -and -not $matchedNew.ContainsKey($j)) {
+            $keyed += [pscustomobject]@{ K = [double]$j; Seq = $seq++; I = $null; J = $j }
+        }
+    }
+
+    $out = New-Object System.Collections.Generic.List[string]
+    $addAll = {
+        param($Tag, $Rows)
+        $n = 0
+        foreach ($r in $Rows) {
+            if ($n -ge $MaxRows) { $out.Add(" …ほか $($Rows.Count - $MaxRows) 行"); break }
+            $out.Add($Tag + (Format-XlsxRow $r)); $n++
+        }
+        if ($Rows.Count -eq 0) { $out.Add(' （空のシート）') }
+    }
+    foreach ($p in ($keyed | Sort-Object -Property K, Seq)) {
+        if ($null -ne $p.I -and $null -ne $p.J) {
+            $lines = Get-RowDiffLines $Old[$p.I].Rows $New[$p.J].Rows
+            $rename = ($Old[$p.I].Name -cne $New[$p.J].Name)
+            if ($lines.Count -eq 0 -and -not $rename) { continue }
+            $title = $(if ($rename) { "$($Old[$p.I].Name) → $($New[$p.J].Name)" } else { $New[$p.J].Name })
+            $out.Add(" ## シート: $title")
+            if ($lines.Count -eq 0) { $out.Add(' （シート名の変更のみ）') }
+            foreach ($l in $lines) { $out.Add($l) }
+        } elseif ($null -ne $p.I) {
+            $out.Add("-## シート: $($Old[$p.I].Name)（削除）")
+            & $addAll '-' $Old[$p.I].Rows
+        } else {
+            $out.Add("+## シート: $($New[$p.J].Name)（追加）")
+            & $addAll '+' $New[$p.J].Rows
+        }
+        $out.Add(' ')
+    }
+    if ($out.Count -gt 0) { $out.RemoveAt($out.Count - 1) }
+    return ,$out.ToArray()
+}
+
 # ========================================================================= 差分
 
-function Get-EditOps([string[]]$A, [string[]]$B) {
+function Get-EditOps([string[]]$A, [string[]]$B, [long]$MaxCells = 0) {
     # LCS による編集列。戻り値: @{Tag=' '|'-'|'+'; Text; AI; BI} の配列（AI/BI は0始まりの行番号）
+    # MaxCells を指定すると、計算表がそれより大きくなる場合は計算せず $null を返す（巨大な Excel シート用）
     if ($null -eq $A) { $A = @() }
     if ($null -eq $B) { $B = @() }
     $ops = New-Object System.Collections.Generic.List[object]
@@ -291,6 +562,7 @@ function Get-EditOps([string[]]$A, [string[]]$B) {
     for ($k = 0; $k -lt $pre; $k++) { $ops.Add(@{ Tag = ' '; Text = $A[$k]; AI = $k; BI = $k }) }
 
     $an = $n - $pre - $suf; $bm = $m - $pre - $suf
+    if ($MaxCells -gt 0 -and [long]$an * $bm -gt $MaxCells) { return $null }
     $dp = New-Object 'int[][]' ($an + 1)
     for ($i = 0; $i -le $an; $i++) { $dp[$i] = New-Object 'int[]' ($bm + 1) }
     for ($i = $an - 1; $i -ge 0; $i--) {
@@ -320,7 +592,9 @@ function Get-EditOps([string[]]$A, [string[]]$B) {
 function Get-LcsRatio([string[]]$A, [string[]]$B) {
     $t = $A.Count + $B.Count
     if ($t -eq 0) { return 1.0 }
-    $same = @(Get-EditOps $A $B | Where-Object { $_.Tag -eq ' ' }).Count
+    # 関数の戻り値は配列1個として渡ってくるので、いったん変数に受けてから数える
+    $ops = Get-EditOps $A $B
+    $same = @($ops | Where-Object { $_.Tag -eq ' ' }).Count
     return (2.0 * $same / $t)
 }
 
@@ -504,16 +778,17 @@ function Get-ChangeBlockHtml($Dels, $Adds) {
     return $sb.ToString()
 }
 
-function Get-DiffHtmlBody([string[]]$Lines, [bool]$IsSlides) {
-    # 1) 差分行を見出し（スライド／Wordの変更箇所）ごとのまとまりに分ける
+function Get-DiffHtmlBody([string[]]$Lines, [bool]$SkipBlank) {
+    # 1) 差分行を見出し（スライド／シート／Wordの変更箇所）ごとのまとまりに分ける
     $secs = New-Object System.Collections.Generic.List[object]
     $cur = $null
     foreach ($l in $Lines) {
         $hdr = $null
-        if ($l -match '^ ## (スライド .+)$') { $hdr = @{ Title = $Matches[1]; Kind = 'chg' } }
-        elseif ($l -match '^-## (スライド .+?)（削除）$') { $hdr = @{ Title = $Matches[1] + '（削除）'; Kind = 'del' } }
-        elseif ($l -match '^\+## (スライド .+?)（追加）$') { $hdr = @{ Title = $Matches[1] + '（追加）'; Kind = 'add' } }
-        elseif ($l.StartsWith('@@')) { $hdr = @{ Title = ''; Kind = 'hunk' } }
+        if ($l -match '^ ## ((?:スライド|シート:) .+)$') { $hdr = @{ Title = $Matches[1]; Kind = 'chg' } }
+        elseif ($l -match '^-## ((?:スライド|シート:) .+?)（削除）$') { $hdr = @{ Title = $Matches[1] + '（削除）'; Kind = 'del' } }
+        elseif ($l -match '^\+## ((?:スライド|シート:) .+?)（追加）$') { $hdr = @{ Title = $Matches[1] + '（追加）'; Kind = 'add' } }
+        # Word の @@ は新しい変更箇所。Excel のシート内の @@ はシートの中の区切り
+        elseif ($l.StartsWith('@@') -and -not ($cur -and $cur.Kind -ne 'hunk')) { $hdr = @{ Title = ''; Kind = 'hunk' } }
         if ($hdr) { $cur = $hdr; $cur.Lines = New-Object System.Collections.Generic.List[string]; $secs.Add($cur); continue }
         if ($null -eq $cur) { $cur = @{ Title = ''; Kind = 'hunk'; Lines = (New-Object System.Collections.Generic.List[string]) }; $secs.Add($cur) }
         $cur.Lines.Add($l)
@@ -555,7 +830,10 @@ function Get-DiffHtmlBody([string[]]$Lines, [bool]$IsSlides) {
             }
             if ($tag -eq '-') { $dels.Add($text); continue }   # 「+ の後の -」は新しいまとまりの始まり
             if ($tag -eq 'END') { break }
-            if ($IsSlides -and $text -eq '') { continue }       # スライド間の区切りの空行
+            if ($SkipBlank -and $text -eq '') { continue }      # スライド・シート間の区切りの空行
+            if ($l -match '^@@ (.+?) @@$') {                    # シート内の区切り（○行目付近）
+                [void]$body.Append("<div class=`"ln hunk`"><span class=`"sg`">⋯</span><span class=`"tx`">$(ConvertTo-Html $Matches[1])</span></div>`n"); continue
+            }
             [void]$body.Append("<div class=`"ln ctx`"><span class=`"sg`"> </span><span class=`"tx`">$(ConvertTo-Html $text)</span></div>`n")
         }
         [void]$body.Append("</div></section>`n")
@@ -563,11 +841,11 @@ function Get-DiffHtmlBody([string[]]$Lines, [bool]$IsSlides) {
     return @($body.ToString(), ($toc -join "`n"), $secs.Count)
 }
 
-function New-DiffHtml($Old, $New, [string[]]$Diff, [bool]$IsSlides, [int]$Added, [int]$Removed) {
+function New-DiffHtml($Old, $New, [string[]]$Diff, [string]$Ext, [int]$Added, [int]$Removed) {
     $fmt = 'yyyy-MM-dd HH:mm'
-    $parts = Get-DiffHtmlBody $Diff $IsSlides
+    $parts = Get-DiffHtmlBody $Diff ($Ext -ne '.docx')
     $sections = $parts[0]; $toc = $parts[1]; $count = $parts[2]
-    $kind = $(if ($IsSlides) { '変更のあったスライド' } else { '変更箇所' })
+    $kind = @{ '.pptx' = '変更のあったスライド'; '.xlsx' = '変更のあったシート'; '.docx' = '変更箇所' }[$Ext]
     if ($Diff.Count -eq 0) {
         $main = '<p class="nochange">テキストの変更はありません（書式・画像のみの変更の可能性があります）。</p>'
         $nav = ''
@@ -625,6 +903,7 @@ section.sec h2 { margin:0; font-size:15px; padding:8px 12px; background:var(--pa
 .ln.del { background:var(--del); } .ln.del .sg { color:var(--delfg); }
 .ln.add mark { background:var(--addm); color:inherit; border-radius:2px; }
 .ln.del mark { background:var(--delm); color:inherit; border-radius:2px; text-decoration:line-through; }
+.ln.hunk { background:var(--hunk); color:var(--muted); font-size:12px; }
 .nochange { padding:16px; background:var(--panel); border-radius:8px; }
 footer { color:var(--muted); font-size:12px; padding:0 24px 24px; }
 @media (max-width: 760px) { .wrap { display:block; padding:12px; } nav { position:static; margin-bottom:12px; } }
@@ -668,7 +947,7 @@ function Test-FileAssociation([string]$Ext) {
 
 function Show-Usage {
     Write-Host ''
-    Write-Host '使い方: 比較したい Word / PowerPoint ファイルを OfficeDiff.bat にドラッグ＆ドロップしてください。'
+    Write-Host '使い方: 比較したい Word / PowerPoint / Excel ファイルを OfficeDiff.bat にドラッグ＆ドロップしてください。'
     Write-Host '        ・2つまとめてドロップ → すぐに比較'
     Write-Host '        ・1つだけドロップ     → もう1つをファイル選択画面で選ぶ（別フォルダの同名ファイルも可）'
     Write-Host '        ・ダブルクリック       → 2つともファイル選択画面で選ぶ'
@@ -688,7 +967,8 @@ function Select-OfficeFile([string]$Title, [string]$StartDir, [string]$Ext) {
     $dlg.Title = $Title
     if ($Ext -eq '.pptx') { $dlg.Filter = 'PowerPoint (*.pptx)|*.pptx' }
     elseif ($Ext -eq '.docx') { $dlg.Filter = 'Word (*.docx)|*.docx' }
-    else { $dlg.Filter = 'Word / PowerPoint (*.docx;*.pptx)|*.docx;*.pptx' }
+    elseif ($Ext -eq '.xlsx' -or $Ext -eq '.xlsm') { $dlg.Filter = 'Excel (*.xlsx;*.xlsm)|*.xlsx;*.xlsm' }
+    else { $dlg.Filter = 'Word / PowerPoint / Excel (*.docx;*.pptx;*.xlsx;*.xlsm)|*.docx;*.pptx;*.xlsx;*.xlsm' }
     if ($StartDir -and (Test-Path -LiteralPath $StartDir)) { $dlg.InitialDirectory = $StartDir }
     # 黒い画面の裏に隠れないよう、最前面のダミーウィンドウを親にする
     $owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false }
@@ -728,10 +1008,12 @@ try {
         throw '同じファイルが2回選ばれています。別のファイルを選んでください'
     }
     $items = @($files | ForEach-Object { Get-Item -LiteralPath $_ })
-    $ext = $items[0].Extension.ToLower()
-    if ($ext -ne $items[1].Extension.ToLower()) { throw "同じ種類のファイルを指定してください: $($items[0].Name) / $($items[1].Name)" }
-    if (@('.docx', '.pptx') -notcontains $ext) {
-        throw "対応しているのは .docx と .pptx だけです（$ext は未対応。.doc/.ppt は Office で新しい形式に保存し直してください）"
+    # .xlsm（マクロ付き）は .xlsx と同じ扱い
+    $kindOf = { param($e) $e = $e.ToLower(); if ($e -eq '.xlsm') { '.xlsx' } else { $e } }
+    $ext = & $kindOf $items[0].Extension
+    if ($ext -ne (& $kindOf $items[1].Extension)) { throw "同じ種類のファイルを指定してください: $($items[0].Name) / $($items[1].Name)" }
+    if (@('.docx', '.pptx', '.xlsx') -notcontains $ext) {
+        throw "対応しているのは .docx / .pptx / .xlsx だけです（$($items[0].Extension) は未対応。.doc/.ppt/.xls は Office で新しい形式に保存し直してください）"
     }
 
     # 更新日時の古い方を「変更前」に
@@ -744,6 +1026,8 @@ try {
     try {
         if ($ext -eq '.pptx') {
             $diff = Get-SlideDiffLines (Get-Slides $zo) (Get-Slides $zn)
+        } elseif ($ext -eq '.xlsx') {
+            $diff = Get-SheetDiffLines (Get-XlsxSheets $zo) (Get-XlsxSheets $zn)
         } else {
             $diff = Get-UnifiedLines (Get-WordLines $zo) (Get-WordLines $zn)
         }
@@ -785,7 +1069,7 @@ try {
     [System.IO.File]::WriteAllText($outPath, (($out -join "`r`n") + "`r`n"), $utf8)
     # ブラウザで見る用の HTML（外部ファイルやネット接続を使わない1ファイル完結）
     $htmlPath = "$base.html"
-    [System.IO.File]::WriteAllText($htmlPath, (New-DiffHtml $old $new $diff ($ext -eq '.pptx') $added $removed), $utf8)
+    [System.IO.File]::WriteAllText($htmlPath, (New-DiffHtml $old $new $diff $ext $added $removed), $utf8)
 
     Write-Host ''
     Write-Host "変更前: $($old.Name)  ($($old.LastWriteTime.ToString('yyyy-MM-dd HH:mm')))"

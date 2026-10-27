@@ -173,3 +173,65 @@ def test_既定の出力先はツールと同じフォルダのoutput_無けれ�
     res = run_tool(samples / 'v1' / '研修運営マニュアル.docx', samples / 'v2' / '研修運営マニュアル.docx', script=tool / 'OfficeDiff.ps1')
     assert res.returncode == 0
     assert len(list((tool / 'output').glob('*.html'))) == 2
+
+
+# ------------------------------------------------------------------ Excel
+
+def test_Excel_行単位の差分と数式と日付(samples):
+    res = run_tool(samples / 'v1' / '研修実績.xlsx', samples / 'v2' / '研修実績.xlsx', outdir=samples / OUT)
+    assert res.returncode == 0, res.stdout + res.stderr
+    d = output_diff(samples / OUT)
+    assert ' ## シート: 実績' in d
+    # 値の変更（行番号つき）・日付は yyyy-MM-dd
+    assert '-3行目 | A:Linux入門 | B:2026-09-24 | C:12 | D:4.2' in d
+    assert '+3行目 | A:Linux入門 | B:2026-09-24 | C:15 | D:4.2' in d
+    # 挿入した行は「追加」1行だけ。後ろの行（クラウド概論）は変更扱いにならない
+    assert '+4行目 | A:Git/GitHub実践 | B:2026-10-01 | C:16 | D:4.6' in d
+    assert not re.search(r'^[-+].*クラウド概論', d, re.M)
+    # 数式と計算結果
+    assert '-5行目 | A:合計 | C:=SUM(C2:C4) → 50' in d
+    assert '+6行目 | A:合計 | C:=SUM(C2:C5) → 69' in d
+
+
+def test_Excel_シートの名前変更_追加_削除(samples):
+    res = run_tool(samples / 'v1' / '研修実績.xlsx', samples / 'v2' / '研修実績.xlsx', outdir=samples / OUT)
+    assert res.returncode == 0, res.stdout + res.stderr
+    d = output_diff(samples / OUT)
+    assert ' ## シート: 講師一覧 → 講師' in d and '（シート名の変更のみ）' in d
+    assert '-## シート: 旧メモ（削除）' in d
+    assert '+## シート: 来期予定（追加）' in d and '+2行目 | A:AWS入門 | B:2027年1月' in d
+    # 中身が同じで名前だけ変わったシートの行は、追加・削除として出ない
+    assert not re.search(r'^[-+]\d+行目 \| A:山田', d, re.M)
+
+
+def test_Excel_HTML(samples):
+    res = run_tool(samples / 'v1' / '研修実績.xlsx', samples / 'v2' / '研修実績.xlsx', outdir=samples / OUT)
+    assert res.returncode == 0, res.stdout + res.stderr
+    html = output_html(samples / OUT)
+    assert '変更のあったシート（4）' in html
+    assert 'C:1<mark>2</mark>' in html and 'C:1<mark>5</mark>' in html   # セルの値の変化だけハイライト
+    assert 'class="ln hunk"' in html and '3行目付近' in html
+
+
+def test_Excel_巨大シートは行番号で突き合わせる(samples):
+    # 計算量の上限を小さくして、行番号どうしの比較に切り替わる経路を確認する
+    os.environ['OFFICEDIFF_XLSX_MAXCELLS'] = '1'
+    try:
+        res = run_tool(samples / 'v1' / '研修実績.xlsx', samples / 'v2' / '研修実績.xlsx', outdir=samples / OUT)
+    finally:
+        del os.environ['OFFICEDIFF_XLSX_MAXCELLS']
+    assert res.returncode == 0, res.stdout + res.stderr
+    d = output_diff(samples / OUT)
+    # 行番号でそろえるので、挿入以降の行は「変更」として出る（それでも結果は正しく出力される）
+    assert '-4行目 | A:クラウド概論' in d and '+4行目 | A:Git/GitHub実践' in d
+
+
+def test_Excel_xlsmとxlsxは比較できる_ほかの種類とは不可(samples, tmp_path):
+    import shutil as sh
+    m = tmp_path / 'm' / '研修実績.xlsm'
+    m.parent.mkdir()
+    sh.copy(samples / 'v2' / '研修実績.xlsx', m)
+    res = run_tool(samples / 'v1' / '研修実績.xlsx', m, outdir=samples / OUT)
+    assert res.returncode == 0, res.stdout + res.stderr
+    res = run_tool(samples / 'v1' / '研修実績.xlsx', samples / 'v1' / '研修案内.pptx', outdir=samples / OUT)
+    assert res.returncode == 1 and '同じ種類' in res.stdout

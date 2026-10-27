@@ -18,6 +18,7 @@ FILES = [
     'README.md',
     '使い方.txt',
     'images/sample-pptx.png',
+    'images/sample-xlsx.png',
 ]
 
 

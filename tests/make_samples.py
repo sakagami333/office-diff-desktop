@@ -80,4 +80,55 @@ if v2:
     p.part.drop_rel(target.rId)
     sld_ids.remove(target)
 p.save(out / '研修案内.pptx')
+
+# ---- Excel: 研修実績.xlsx ----
+# v1 → v2 の変更: 値の変更 / 行の挿入 / 数式と計算結果の変化 / 日付 / シート名の変更 / シートの追加・削除
+import datetime
+import re
+import zipfile
+from openpyxl import Workbook
+
+wb = Workbook()
+ws = wb.active
+ws.title = '実績'
+ws.append(['研修名', '開催日', '受講者数', '満足度'])
+rows = [('Python基礎', datetime.date(2026, 9, 10), 18, 4.5),
+        ('Linux入門', datetime.date(2026, 9, 24), 12, 4.2),
+        ('クラウド概論', datetime.date(2026, 10, 8), 20, 4.7)]
+if v2:
+    rows = [('Python基礎', datetime.date(2026, 9, 10), 18, 4.5),
+            ('Linux入門', datetime.date(2026, 9, 24), 15, 4.2),       # 受講者数 12 → 15
+            ('Git/GitHub実践', datetime.date(2026, 10, 1), 16, 4.6),  # 行を挿入
+            ('クラウド概論', datetime.date(2026, 10, 8), 20, 4.7)]
+for r in rows:
+    ws.append(list(r))
+    ws.cell(row=ws.max_row, column=2).number_format = 'yyyy/mm/dd'
+total_row = ws.max_row + 1
+ws.cell(row=total_row, column=1, value='合計')
+ws.cell(row=total_row, column=3, value=f'=SUM(C2:C{total_row - 1})')
+total = sum(r[2] for r in rows)
+
+ws2 = wb.create_sheet('講師一覧' if not v2 else '講師')   # シート名の変更（中身は同じ）
+for r in [('氏名', '担当'), ('山田', 'Python'), ('佐藤', 'Linux'), ('鈴木', 'クラウド')]:
+    ws2.append(list(r))
+if not v2:
+    ws3 = wb.create_sheet('旧メモ')                          # v2 では削除
+    ws3.append(['このシートは次の版で削除'])
+else:
+    ws3 = wb.create_sheet('来期予定')                        # v2 で追加
+    ws3.append(['研修名', '予定月'])
+    ws3.append(['AWS入門', '2027年1月'])
+xlsx = out / '研修実績.xlsx'
+wb.save(xlsx)
+
+# openpyxl は数式の計算結果を保存しないため、Excel で保存したファイルと同じく結果（<v>）を書き込む
+with zipfile.ZipFile(xlsx) as z:
+    items = {n: z.read(n) for n in z.namelist()}
+sheet = items['xl/worksheets/sheet1.xml'].decode('utf-8')
+sheet, n = re.subn(r'(<f>SUM\([^<]*\)</f>)(<v\s*/>|<v></v>)?', rf'\1<v>{total}</v>', sheet)
+assert n == 1, n
+items['xl/worksheets/sheet1.xml'] = sheet.encode('utf-8')
+with zipfile.ZipFile(xlsx, 'w', zipfile.ZIP_DEFLATED) as z:
+    for name, data in items.items():
+        z.writestr(name, data)
 print('done', version)
