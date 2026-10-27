@@ -1,0 +1,4 @@
+# テスト用（ツール本体は Windows 標準の PowerShell だけで動き、これらは不要）
+python-docx>=1.1   # テスト用サンプル資料の生成
+python-pptx>=1.0
+pytest>=8.0

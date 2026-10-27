@@ -1,0 +1,4 @@
+output/
+OfficeDiff.zip
+__pycache__/
+.pytest_cache/
